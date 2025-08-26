@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+TSI Flow Meter Data Collection Module
+
+This module provides functionality to interface with TSI Series 4000/4100 
+thermal mass flow meters via RS232 serial communication.
+
+@author: Converted from Ruby script TSICollect.rb
+@date: July 21, 2025
+@version: 1.0
+
+@example:
+python TSICollect.py --com COM3 --output test_data_1 --duration 60   # Collect data for 60 seconds and save to test_data_1.csv
+"""
+
+import sys
+import time
+from datetime import datetime
+import os
+import serial
+import argparse
+from typing import Optional, Tuple
+
+
+class TSIFlowMeter:
+    """
+    TSI Flow Meter interface class for Series 4000/4100 thermal mass flow meters.
+    
+    This class provides methods to communicate with TSI flow meters via RS232 serial
+    communication, including data collection, sample rate configuration, and 
+    command execution.
+    
+    Attributes:
+        port (serial.Serial): The serial port connection
+        com_name (str): The COM port name
+        baud_rate (int): The baud rate for serial communication (default: 38400)
+    """
+    
+    def __init__(self, com_port: str = "COM1", baud_rate: int = 38400):
+        """
+        Initialize TSI Flow Meter interface.
+        
+        @param com_port: COM port name (e.g., "COM1", "COM2")
+        @param baud_rate: Serial communication baud rate (default: 38400)
+        """
+        self.com_name = com_port
+        self.baud_rate = baud_rate
+        self.port: Optional[serial.Serial] = None
+        
+    def open_port(self) -> bool:
+        """
+        Open the serial port connection to the TSI flow meter.
+        
+        @return: True if port opened successfully, False otherwise
+        """
+        try:
+            self.port = serial.Serial(
+                port=self.com_name,
+                baudrate=self.baud_rate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=5.0
+            )
+            return True
+        except Exception as e:
+            print(f"Error opening port {self.com_name}: {e}")
+            return False
+    
+    def close_port(self) -> None:
+        """
+        Close the serial port connection.
+        """
+        if self.port and self.port.is_open:
+            self.port.close()
+            
+    def read_until_crlf(self) -> str:
+        """
+        Read data from the TSI port until CR-LF sequence or timeout.
+        
+        @return: Response string with non-printable characters filtered out
+        """
+        if not self.port:
+            return ""
+            
+        response = ""
+        last_char = 0
+        
+        while True:
+            try:
+                data = self.port.read(1)
+                if not data:  # Timeout
+                    break
+                    
+                char_code = data[0]
+                
+                # Only append printable characters (ASCII > 31)
+                if char_code > 31:
+                    response += chr(char_code)
+                
+                # Check for CR-LF sequence (13, 10)
+                if char_code == 10 and last_char == 13:
+                    break
+                    
+                last_char = char_code
+                
+            except Exception:
+                break
+                
+        return response
+    
+    def send_tsi_command(self, command: str) -> str:
+        """
+        Send a command to the TSI port and receive response.
+        
+        @param command: Command string to send to the flow meter
+        @return: Response status string from the device
+        """
+        if not self.port:
+            return "ERR"
+            
+        try:
+            # Send command byte by byte followed by carriage return
+            for char in command:
+                self.port.write(char.encode('ascii'))
+            self.port.write(b'\r')  # Send carriage return
+            
+            # Read response
+            status = self.read_until_crlf()
+            return status
+            
+        except Exception:
+            return "ERR"
+    
+    def set_sample_rate(self, msecs: int = 0) -> str:
+        """
+        Set the TSI flow meter sample rate.
+        
+        @param msecs: Sample rate in milliseconds (0-9999)
+        @return: Status string ("OK" or "ERR")
+        """
+        try:
+            command = f"SSR{msecs:04d}"
+            return self.send_tsi_command(command)
+        except Exception:
+            return "ERR"
+    
+    def get_data_from_tsi(self, cmd: str = "FTP", count: int = 1) -> str:
+        """
+        Get data from the TSI flow meter.
+        
+        @param cmd: Data format command (e.g., "FTP" for Flow/Temperature/Pressure)
+        @param count: Number of data points to retrieve (1-1000)
+        @return: Data string or "ERR" if failed
+        """
+        try:
+            command = f"DC{cmd}{count:04d}"
+            status = self.send_tsi_command(command)
+            
+            if status != "OK":
+                return "ERR"
+            
+            response = ""
+            for i in range(count):
+                data_line = self.read_until_crlf()
+                response += data_line + "\n"
+                
+            return response
+            
+        except Exception:
+            return "ERR"
+    
+    def sample_data(self, file_handle, duration: int) -> None:
+        """
+        Sample data from the TSI flow meter for the specified duration.
+        
+        @param file_handle: File handle to write data to
+        @param duration: Sampling duration in seconds
+        """
+        start_time = time.time()
+        last_output = start_time
+        sample_count = 0
+        
+        print(f"Collecting data for {duration} seconds...")
+        
+        while True:
+            current_time = time.time()
+            
+            # Print progress indicator every 10 seconds
+            if (current_time - last_output) > 10:
+                print("*", end="", flush=True)
+                last_output = current_time
+            
+            # Calculate elapsed time from start in milliseconds
+            elapsed_ms = (current_time - start_time) * 1000
+            
+            # Stop after duration + 5 seconds buffer
+            if elapsed_ms > ((duration + 5) * 1000):
+                break
+                
+            # Get data from TSI
+            tsi_data = self.get_data_from_tsi().strip()
+            sample_count += 1
+            
+            # Write to file: Sample#, Elapsed (ms), Wall Clock, TSI Data
+            file_handle.write(f"{sample_count},{elapsed_ms:.1f},{current_time:.4f},{tsi_data}\n")
+        
+        print()  # New line after progress indicators
+        print(f"Data collection complete. {sample_count} samples collected.")
+    def export_data_to_csv(self, command: str, count: int, csv_filename: str) -> bool:
+        """
+        Export data to a CSV file, streaming from the flow meter.
+        @param command: Full TSI command string (e.g., 'DCFTP0010' or 'VM0005')
+        @param count: Number of data lines to retrieve
+        @param csv_filename: Output CSV file path
+        @return: True on success, False on error
+        """
+        # Determine header based on command prefix, include elapsed time
+        if command.startswith(("DCFTP", "DBFTP")):
+            header = "Elapsed_ms,Flow,Temperature,Pressure"
+        elif command.startswith("DCFxP"):
+            header = "Elapsed_ms,Flow,Pressure"
+        elif command.startswith("DCxTP"):
+            header = "Elapsed_ms,Temperature,Pressure"
+        elif command.startswith("DCFTx"):
+            header = "Elapsed_ms,Flow,Temperature"
+        elif command.startswith("VM"):
+            header = "Elapsed_ms,Volume"
+        else:
+            header = "Elapsed_ms,Data"
+        try:
+            with open(csv_filename, "w") as f:
+                f.write(header + "\n")
+                # Send command to meter
+                status = self.send_tsi_command(command)
+                if status != "OK":
+                    print(f"Error sending command {command}: {status}")
+                    return False
+                # Record start time for elapsed calculation
+                start_time = time.time()
+                # Read and write each line
+                for i in range(count):
+                    current_time = time.time()
+                    elapsed_ms = (current_time - start_time) * 1000
+                    raw = self.read_until_crlf().strip()
+                    csv_line = f"{elapsed_ms:.1f},{raw}"
+                    print(csv_line)
+                    f.write(csv_line + "\n")
+            return True
+        except Exception as e:
+            print(f"Error exporting to CSV: {e}")
+            return False
