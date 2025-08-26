@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+"""
+TSI Flow Meter Interactive Driver
+
+Interactive command-line interface and standalone data collection tool for TSI Series 4000/4100 
+thermal mass flow meters. This is the main driver application that uses the TSICollect module.
+
+Usage:
+  Interactive Mode:
+    python TSI_Interactive_Driver.py [COM_PORT]
+    
+  Standalone Data Collection:
+    python TSI_Interactive_Driver.py --standalone --com COM3 --output test_data_1 --duration 60
+    
+  Auto-connect in Interactive Mode:
+    python TSI_Interactive_Driver.py COM3
+
+@author: Converted and extended from Ruby TSICollect.rb
+@date: July 21, 2025
+@version: 1.0
+
+Commands are based on TSI RS232 Serial Command Set (P/N 1980340, Rev L, March 2022)
+"""
+
+import sys
+import os
+import time
+import json
+import argparse
+from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime
+from TSICollect import TSIFlowMeter
+
+
+class TSIInteractiveDriver:
+    """
+    Interactive driver class for TSI Flow Meter operations.
+    
+    Provides a menu-driven interface for sending commands to TSI Series 4000/4100
+    thermal mass flow meters. Supports both direct command entry and numbered
+    menu selections for ease of use.
+    
+    Attributes:
+        tsi (TSIFlowMeter): The TSI flow meter interface instance
+        commands (Dict): Dictionary of available commands and their descriptions
+        is_connected (bool): Connection status flag
+    """
+    
+    def __init__(self):
+        """Initialize the interactive driver."""
+        self.tsi: Optional[TSIFlowMeter] = None
+        self.is_connected = False
+        self.commands = self._initialize_commands()
+        
+    def _initialize_commands(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Initialize the command dictionary with TSI RS232 command set.
+        
+        Based on TSI Series 4000/4100 RS232 Serial Command Set documentation.
+        Commands are organized by category for easier navigation.
+        
+        @return: Dictionary containing all available commands with descriptions and parameters
+        """
+        return {
+            # Data Collection Commands
+            "5": {
+                "name": "DCFTP",
+                "description": "Get Flow, Temperature, and Pressure data (ASCII format)",
+                "category": "Data Collection",
+                "template": "DCFTP{count:04d}",
+                "params": ["count"],
+                "param_desc": {"count": "Number of samples (1-1000)"},
+                "example": "DCFTP0001"
+            },
+            "6": {
+                "name": "DCFTP_Multiple",
+                "description": "Get multiple FTP readings",
+                "category": "Data Collection", 
+                "template": "DCFTP{count:04d}",
+                "params": ["count"],
+                "param_desc": {"count": "Number of samples (1-1000)"},
+                "example": "DCFTP0010"
+            },
+            "7": {
+                "name": "DCFxP",
+                "description": "Get Flow and Pressure data (no temperature)",
+                "category": "Data Collection",
+                "template": "DCFxP{count:04d}",
+                "params": ["count"],
+                "param_desc": {"count": "Number of samples (1-1000)"},
+                "example": "DCFxP0001"
+            },
+            "8": {
+                "name": "DCxTP",
+                "description": "Get Temperature and Pressure data (no flow)",
+                "category": "Data Collection",
+                "template": "DCxTP{count:04d}",
+                "params": ["count"],
+                "param_desc": {"count": "Number of samples (1-1000)"},
+                "example": "DCxTP0001"
+            },
+            "9": {
+                "name": "DCFTx",
+                "description": "Get Flow and Temperature data (no pressure)",
+                "category": "Data Collection",
+                "template": "DCFTx{count:04d}",
+                "params": ["count"],
+                "param_desc": {"count": "Number of samples (1-1000)"},
+                "example": "DCFTx0001"
+            },
+            "10": {
+                "name": "DBFTP",
+                "description": "Get Flow, Temperature, and Pressure data (Binary format)",
+                "category": "Data Collection",
+                "template": "DBFTP{count:04d}",
+                "params": ["count"],
+                "param_desc": {"count": "Number of samples (1-1000)"},
+                "example": "DBFTP0001"
+            },
+            
+            # Sample Rate Commands
+            "11": {
+                "name": "SSR",
+                "description": "Set Sample Rate",
+                "category": "Setup",
+                "template": "SSR{rate:04d}",
+                "params": ["rate"],
+                "param_desc": {"rate": "Sample rate in milliseconds (0-9999)"},
+                "example": "SSR0050"
+            },
+            
+            # Gas Calibration Commands
+            "12": {
+                "name": "SG0",
+                "description": "Set Gas Calibration to Air",
+                "category": "Setup",
+                "template": "SG0",
+                "params": [],
+                "param_desc": {},
+                "example": "SG0"
+            },
+            "13": {
+                "name": "SG1",
+                "description": "Set Gas Calibration to Gas 1",
+                "category": "Setup",
+                "template": "SG1",
+                "params": [],
+                "param_desc": {},
+                "example": "SG1"
+            },
+            "14": {
+                "name": "SG2", 
+                "description": "Set Gas Calibration to Gas 2",
+                "category": "Setup",
+                "template": "SG2",
+                "params": [],
+                "param_desc": {},
+                "example": "SG2"
+            },
+            
+            # Trigger Commands
+            "17": {
+                "name": "SBT",
+                "description": "Set Begin Trigger Level",
+                "category": "Setup",
+                "template": "SBT{type}{level:06.2f}",
+                "params": ["type", "level"],
+                "param_desc": {"type": "F/T/P for Flow/Temperature/Pressure", "level": "Trigger level value"},
+                "example": "SBTF001.50"
+            },
+            "18": {
+                "name": "SET",
+                "description": "Set End Trigger Level",
+                "category": "Setup", 
+                "template": "SET{type}{level:06.2f}",
+                "params": ["type", "level"],
+                "param_desc": {"type": "F/T/P for Flow/Temperature/Pressure", "level": "Trigger level value"},
+                "example": "SETF010.00"
+            },
+            "19": {
+                "name": "CBT",
+                "description": "Clear Begin Trigger",
+                "category": "Setup",
+                "template": "CBT",
+                "params": [],
+                "param_desc": {},
+                "example": "CBT"
+            },
+            "20": {
+                "name": "CET",
+                "description": "Clear End Trigger",
+                "category": "Setup",
+                "template": "CET",
+                "params": [],
+                "param_desc": {},
+                "example": "CET"
+            },
+            
+            # Volume Measurement Commands
+            "21": {
+                "name": "VM",
+                "description": "Get Volume Measurement",
+                "category": "Data Collection",
+                "template": "VM{count:04d}",
+                "params": ["count"],
+                "param_desc": {"count": "Number of volume readings (1-1000)"},
+                "example": "VM0001"
+            },
+            
+            # Analog Output Commands
+            "22": {
+                "name": "SAS",
+                "description": "Set Analog Scale (Full-scale flow rate)",
+                "category": "Analog Output",
+                "template": "SAS{scale:03d}",
+                "params": ["scale"],
+                "param_desc": {"scale": "Full-scale flow rate (0-999)"},
+                "example": "SAS100"
+            },
+            "23": {
+                "name": "SAZ",
+                "description": "Set Analog Zero (Zero intercept)",
+                "category": "Analog Output", 
+                "template": "SAZ{zero:03d}",
+                "params": ["zero"],
+                "param_desc": {"zero": "Zero intercept value (0-999)"},
+                "example": "SAZ000"
+            },
+            
+            # Display Commands (Series 4100 only)
+            "24": {
+                "name": "SUR",
+                "description": "Set Display Update Rate",
+                "category": "Display",
+                "template": "SUR{rate:04d}",
+                "params": ["rate"],
+                "param_desc": {"rate": "Update rate in milliseconds"},
+                "example": "SUR1000"
+            },
+            "25": {
+                "name": "SDMFTP",
+                "description": "Set Display Mode to scroll F/T/P (4100 only)",
+                "category": "Display",
+                "template": "SDMFTP{mode}",
+                "params": ["mode"],
+                "param_desc": {"mode": "Display mode (0-9)"},
+                "example": "SDMFTP2"
+            },
+            "26": {
+                "name": "SDM",
+                "description": "Set Display Mode (4100 only)",
+                "category": "Display",
+                "template": "SDM{mode}",
+                "params": ["mode"],
+                "param_desc": {"mode": "Display mode (0-9)"},
+                "example": "SDM1"
+            },
+            "27": {
+                "name": "SDU",
+                "description": "Set Display Units (4100 only)",
+                "category": "Display",
+                "template": "SDU{unit}",
+                "params": ["unit"],
+                "param_desc": {"unit": "0=L/min, 1=cm³/min"},
+                "example": "SDU0"
+            },
+            
+            # Information Commands
+            "28": {
+                "name": "SN",
+                "description": "Get Serial Number",
+                "category": "Information",
+                "template": "SN",
+                "params": [],
+                "param_desc": {},
+                "example": "SN"
+            },
+            "29": {
+                "name": "MN",
+                "description": "Get Model Number",
+                "category": "Information",
+                "template": "MN",
+                "params": [],
+                "param_desc": {},
+                "example": "MN"
+            },
+            "30": {
+                "name": "REV",
+                "description": "Get Firmware Revision",
+                "category": "Information",
+                "template": "REV", 
+                "params": [],
+                "param_desc": {},
+                "example": "REV"
+            },
+            "31": {
+                "name": "DATE",
+                "description": "Get Last Calibration Date",
+                "category": "Information",
+                "template": "DATE",
+                "params": [],
+                "param_desc": {},
+                "example": "DATE"
+            },
+            "32": {
+                "name": "?",
+                "description": "Communication Test (returns OK)",
+                "category": "Information",
+                "template": "?",
+                "params": [],
+                "param_desc": {},
+                "example": "?"
+            },
+            
+            # Configuration Commands
+            "33": {
+                "name": "R",
+                "description": "Read Current Parameter Values",
+                "category": "Configuration",
+                "template": "R{param}",
+                "params": ["param"],
+                "param_desc": {"param": "Parameter code (see manual)"},
+                "example": "RSR"
+            },
+            "34": {
+                "name": "SAVE",
+                "description": "Save Parameters to Non-volatile Memory",
+                "category": "Configuration",
+                "template": "SAVE",
+                "params": [],
+                "param_desc": {},
+                "example": "SAVE"
+            },
+            "35": {
+                "name": "DEFAULT",
+                "description": "Restore Factory Default Settings",
+                "category": "Configuration",
+                "template": "DEFAULT",
+                "params": [],
+                "param_desc": {},
+                "example": "DEFAULT"
+            },
+            
+            # Special Commands
+            "36": {
+                "name": "COLLECT",
+                "description": "Start Data Collection Session",
+                "category": "Special",
+                "template": "COLLECT",
+                "params": [],
+                "param_desc": {},
+                "example": "COLLECT"
+            }
+        }
+    
+    def connect_to_meter(self, com_port: Optional[str] = None) -> bool:
+        """
+        Connect to the TSI flow meter.
+        
+        @param com_port: COM port name (if None, will prompt user)
+        @return: True if connected successfully, False otherwise
+        """
+        if not com_port:
+            com_port = input("Enter COM port (e.g., COM1): ").strip().upper()
+            if not com_port.startswith("COM"):
+                com_port = f"COM{com_port}"
+        
+        print(f"Connecting to {com_port}...")
+        self.tsi = TSIFlowMeter(com_port)
+        
+        if self.tsi.open_port():
+            self.is_connected = True
+            print(f"Connected to TSI Flow Meter on {com_port}")
+            
+            # Test communication
+            response = self.tsi.send_tsi_command("?")
+            if response == "OK":
+                print("Communication test successful!")
+                # Configure meter settings
+                print("Configure meter settings:")
+                # Sample rate selection
+                print("Sample Rate (ms):")
+                print("1) 50")
+                print("2) 100")
+                print("3) 200")
+                print("4) 500")
+                print("5) 1000")
+                print("6) Custom")
+                choice = input("Enter choice [1-6] (default 5): ").strip()
+                if choice == '1': rate = 50
+                elif choice == '2': rate = 100
+                elif choice == '3': rate = 200
+                elif choice == '4': rate = 500
+                elif choice == '5' or choice == '': rate = 1000
+                elif choice == '6':
+                    try:
+                        rate = int(input("Enter custom sample rate in ms: "))
+                    except ValueError:
+                        rate = 1000
+                else:
+                    rate = 1000
+                status = self.tsi.set_sample_rate(rate)
+                if status != "OK":
+                    print(f"Warning: Failed to set sample rate to {rate} ms. Status: {status}")
+                # Gas calibration selection
+                print("Gas Calibration:")
+                print("0) Air (SG0)")
+                print("1) 100% O_2 (SG1)")
+                print("6) 100% N_2 (SG2)")
+                choice = input("Enter choice [0,1,6] (default 0): ").strip()
+                if choice == '1':
+                    cmd = 'SG1'
+                elif choice == '6':
+                    cmd = 'SG2'
+                else:
+                    cmd = 'SG0'
+
+                resp = self.tsi.send_tsi_command(cmd)
+                if resp != "OK":
+                    print(f"Warning: Failed to set gas calibration {cmd}. Status: {resp}")
+                return True
+            else:
+                print(f"Warning: Communication test returned: {response}")
+                return True
+        else:
+            print(f"Failed to connect to {com_port}")
+            self.is_connected = False
+            return False
+    
+    def disconnect(self) -> None:
+        """Disconnect from the TSI flow meter."""
+        if self.tsi and self.is_connected:
+            self.tsi.close_port()
+            self.is_connected = False
+            print("Disconnected from TSI Flow Meter")
+    
+    def display_menu(self) -> None:
+        """Display the interactive command menu organized by categories."""
+        print("\n" + "="*80)
+        print("TSI FLOW METER INTERACTIVE DRIVER")
+        print("="*80)
+        
+        if not self.is_connected:
+            print("Status: NOT CONNECTED")
+            print("\nConnect to meter first using option '1' or 'connect'")
+        else:
+            print("Status: CONNECTED")
+        
+        # Group commands by category
+        categories = {}
+        for cmd_num, cmd_info in self.commands.items():
+            category = cmd_info["category"]
+            if category not in categories:
+                categories[category] = []
+            categories[category].append((cmd_num, cmd_info))
+        
+        # Display commands by category
+        for category, cmd_list in categories.items():
+            print(f"\n--- {category.upper()} COMMANDS ---")
+            for cmd_num, cmd_info in cmd_list:
+                print(f"{cmd_num:2s}. {cmd_info['name']:<15} - {cmd_info['description']}")
+        
+        print(f"\n--- SYSTEM COMMANDS ---")
+        print("0. quit         - Exit program")
+        print("1. connect      - Connect to flow meter")
+        print("2. disconnect   - Disconnect from flow meter") 
+        print("3. help (or h)  - Show this menu")
+        print("4. status       - Show connection status")
+        print("\nUsage: Enter command number, command name, or system command")
+        print("="*80)
+    
+    def execute_command(self, user_input: str) -> None:
+        """
+        Execute a command based on user input.
+        
+        @param user_input: User's command input (number, name, or system command)
+        """
+        user_input = user_input.strip()
+        
+        if not user_input:
+            return
+            
+        # Handle system commands
+        if user_input in ['0'] or user_input.lower() in ['quit', 'exit']:
+            return
+        elif user_input in ['1'] or user_input.lower() in ['connect']:
+            self.connect_to_meter()
+            return
+        elif user_input in ['2'] or user_input.lower() in ['disconnect']:
+            self.disconnect()
+            return
+        elif user_input in ['3'] or user_input.lower() in ['help', 'h']:
+            self.display_menu()
+            return
+        elif user_input in ['4'] or user_input.lower() in ['status']:
+            status = "CONNECTED" if self.is_connected else "NOT CONNECTED"
+            print(f"Connection Status: {status}")
+            return
+        
+        # Check if connected for TSI commands
+        if not self.is_connected:
+            print("Error: Not connected to flow meter. Use '1' or 'connect' first.")
+            return
+        
+        # Handle numbered commands
+        if user_input in self.commands:
+            cmd_info = self.commands[user_input]
+            self._execute_tsi_command(cmd_info)
+            return
+        
+        # Handle direct command names
+        for cmd_num, cmd_info in self.commands.items():
+            if cmd_info["name"].lower() == user_input.lower():
+                self._execute_tsi_command(cmd_info)
+                return
+        
+        # Handle special case for data collection
+        if user_input.lower() == 'collect':
+            self._start_data_collection()
+            return
+        
+        # Handle direct command input (pass through)
+        if not self.tsi:
+            print("Error: TSI interface not initialized")
+            return
+            
+        print(f"Sending direct command: {user_input}")
+        response = self.tsi.send_tsi_command(user_input)
+        print(f"Response: {response}")
+    
+    def _execute_tsi_command(self, cmd_info: Dict[str, Any]) -> None:
+        """
+        Execute a TSI command with parameter collection if needed.
+        
+        @param cmd_info: Command information dictionary
+        """
+        if not self.tsi:
+            print("Error: TSI interface not initialized")
+            return
+            
+        print(f"\nExecuting: {cmd_info['name']} - {cmd_info['description']}")
+        
+        params = {}  # Initialize params dictionary
+        
+        if cmd_info["params"]:
+            # Collect parameters from user
+            for param in cmd_info["params"]:
+                param_desc = cmd_info["param_desc"].get(param, param)
+                value = input(f"Enter {param} ({param_desc}): ").strip()
+                
+                # Convert to appropriate type
+                if param in ["count", "rate", "scale", "zero", "mode", "unit"]:
+                    try:
+                        params[param] = int(value)
+                    except ValueError:
+                        print(f"Invalid integer value for {param}")
+                        return
+                elif param == "level":
+                    try:
+                        params[param] = float(value)
+                    except ValueError:
+                        print(f"Invalid float value for {param}")
+                        return
+                else:
+                    params[param] = value
+            
+            # Format command with parameters
+            try:
+                command = cmd_info["template"].format(**params)
+            except (KeyError, ValueError) as e:
+                print(f"Error formatting command: {e}")
+                return
+        else:
+            command = cmd_info["template"]
+        
+        # Handle data collection commands with optional CSV saving
+        cmd_name = cmd_info["name"]
+        # Data collection commands
+        if cmd_name.startswith("DC") or cmd_name == "VM":
+            count = params.get("count", 1)
+            # Ask up about saving to CSV (default is y)
+            save = input("Save data to CSV file? [y/n]: ").strip().lower()
+            if save == '':
+                save = 'y'
+            if save == 'y':
+                custom = input("Enter custom name (optional): ").strip()
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"{timestamp}_{custom}" if custom else timestamp
+                csv_filename = f"{filename}.csv"
+                # Delegate to TSICollect export
+                if self.tsi.export_data_to_csv(command, count, csv_filename):
+                    print(f"Data saved to {csv_filename}")
+                else:
+                    print("Failed to export data to CSV.")
+                return
+            # No CSV: stream data
+            print(f"Sending command: {command}")
+            status = self.tsi.send_tsi_command(command)
+            if status != "OK":
+                print(f"Command error: {status}")
+                return
+            # Stream and display each data line with timestamp
+            for _ in range(count):
+                raw = self.tsi.read_until_crlf().strip()
+                ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                print(f"{ts},{raw}")
+            return
+        # Regular commands
+        print(f"Sending command: {command}")
+        response = self.tsi.send_tsi_command(command)
+        print(f"Response: {response}")
+        # If command returns additional data, read it
+        if response == "OK" and cmd_info["name"] in ["SN", "MN", "REV", "DATE"]:
+            additional_data = self.tsi.read_until_crlf()
+            if additional_data:
+                print(f"Data: {additional_data}")
+    
+    def _start_data_collection(self) -> None:
+        """Start an interactive data collection session."""
+        if not self.tsi:
+            print("Error: TSI interface not initialized")
+            return
+            
+        print("\n--- DATA COLLECTION SESSION ---")
+        
+        try:
+            # Get collection parameters
+            duration = input("Enter collection duration in seconds (default: 300): ").strip()
+            duration = int(duration) if duration else 300
+            
+            sample_rate = input("Enter sample rate in ms (default: 50): ").strip()
+            sample_rate = int(sample_rate) if sample_rate else 50
+            
+            # Use current timestamp and optional custom name for filename
+            custom = input("Enter custom name for file (optional): ").strip()
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            if custom:
+                filename = f"{timestamp}_{custom}"
+            else:
+                filename = timestamp
+            
+            # Set sample rate
+            print(f"Setting sample rate to {sample_rate}ms...")
+            status = self.tsi.set_sample_rate(sample_rate)
+            if status != "OK":
+                print(f"Warning: Failed to set sample rate. Status: {status}")
+            
+            # Start data collection
+            full_filename = f"{filename}.csv"
+            print(f"Starting data collection for {duration} seconds...")
+            print(f"Saving to: {full_filename}")
+            
+            with open(full_filename, "w") as file_handle:
+                file_handle.write("Sample,Elapsed_ms,Wall,Flow,Temperature,Pressure\n")
+                self.tsi.sample_data(file_handle, duration)
+            
+            print(f"Data collection completed! Data saved to {full_filename}")
+            
+        except Exception as e:
+            print(f"Error during data collection: {e}")
+    
+    def run(self) -> None:
+        """Run the interactive driver main loop."""
+        print("TSI Flow Meter Interactive Driver")
+        print("Type '3', 'h', or 'help' for menu, '0' or 'quit' to exit")
+
+        try:
+            while True:
+                try:
+                    user_input = input("\nTSI> ").strip()
+                    
+                    if user_input in ['0'] or user_input.lower() in ['quit', 'exit']:
+                        break
+                    
+                    self.execute_command(user_input)
+                    
+                except KeyboardInterrupt:
+                    print("\nKeyboard interrupt received, exiting.")
+                    break
+                except EOFError:
+                    break
+        
+        finally:
+            self.disconnect()
+            print("Goodbye!")
+
+
+def get_collection_parameters() -> Tuple[str, str, int]:
+    """
+    Get collection parameters from command line arguments or user input.
+    
+    @return: Tuple of (com_port, output_filename, duration_seconds)
+    """
+    parser = argparse.ArgumentParser(description="TSI Flow Meter Data Collection")
+    parser.add_argument("--com", help="COM port (e.g., COM1)")
+    parser.add_argument("--output", help="Output filename prefix (no extension)")
+    parser.add_argument("--duration", type=int, help="Sampling duration in seconds")
+    parser.add_argument("--standalone", action="store_true", help="Run standalone data collection instead of interactive mode")
+
+    args = parser.parse_args()
+    
+    # Get COM port
+    com_port = "COM1"
+    if args.com:
+        com_port = args.com.upper()
+        if not com_port.startswith("COM"):
+            com_port = f"COM{com_port}"
+    else:
+        user_input = input(f"Enter the TSI flow meter COM port number (default = {com_port[3:]}): ").strip()
+        if user_input:
+            if user_input.upper().startswith("COM"):
+                com_port = user_input.upper()
+            else:
+                com_port = f"COM{user_input}"
+    
+    # Use current date and time as default
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_file = timestamp
+
+    if args.output:
+        # If user passed --output, insert it before the timestamp
+        output_file = f"{args.output}_{timestamp}"
+    else:
+        # Interactive prompt: default is the timestamp
+        user_input = input(f"Enter the output filename prefix (no extension, default = {timestamp}): ").strip()
+        if user_input:
+            output_file = f"{user_input}_{timestamp}"
+    
+    # Get duration
+    duration = 300
+    if args.duration:
+        duration = args.duration
+    else:
+        user_input = input(f"Enter the sampling duration in seconds (default = {duration}): ").strip()
+        if user_input:
+            try:
+                duration = int(user_input)
+            except ValueError:
+                print(f"Invalid duration, using default: {duration}")
+    
+    # Handle file path
+    if not os.path.dirname(output_file):
+        # No path specified, use current working directory
+        cwd = os.getcwd()
+        output_file = os.path.join(cwd, output_file)
+    
+    # Normalize path separators for Windows
+    output_file = os.path.normpath(output_file)
+    
+    return com_port, output_file, duration
+
+
+def standalone_data_collection():
+    """
+    Standalone data collection function for command-line usage.
+    """
+    try:
+        # Ensure stdout is not buffered (similar to $stdout.sync = true in Ruby)
+        sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 1)  # Line buffering
+        
+        # Get collection parameters
+        com_port, output_file, duration = get_collection_parameters()
+        
+        print(f"COM Port: {com_port}")
+        print(f"Output file: {output_file}.csv")
+        print(f"Duration: {duration} seconds")
+        
+        # Initialize TSI flow meter
+        tsi = TSIFlowMeter(com_port)
+        
+        # Open serial port
+        if not tsi.open_port():
+            print(f"Unable to open COM port >{com_port}<")
+            return 1
+        
+        print(f"Preparing to sample for {duration} seconds")
+        print(f"Saving raw data to {output_file}.csv")
+        
+        # Open output file
+        with open(f"{output_file}.csv", "w") as file_handle:
+            file_handle.write("Sample,Elapsed_ms,Wall,Flow,Temperature,Pressure\n")
+            
+            print(f"Setting flow meter sampling rate to {duration}ms...")
+            status = tsi.set_sample_rate(duration)
+            if status != "OK":
+                print(f"Warning: Failed to set sample rate. Status: {status}")
+            
+            print("Collecting data...")
+            tsi.sample_data(file_handle, duration)
+        
+        print("Data collection completed successfully!")
+        
+        # Close port
+        tsi.close_port()
+        return 0
+        
+    except KeyboardInterrupt:
+        print("\nData collection interrupted by user.")
+        return 1
+    except Exception as e:
+        print(f"Error during data collection: {e}")
+        return 1
+
+
+def main():
+    """Main function to start the interactive driver or standalone data collection."""
+    # Parse command line arguments to check for standalone mode
+    parser = argparse.ArgumentParser(description="TSI Flow Meter Interactive Driver", add_help=False)
+    parser.add_argument("--standalone", action="store_true", help="Run standalone data collection instead of interactive mode")
+    
+    # Parse known args to avoid conflicts with other arguments
+    args, remaining = parser.parse_known_args()
+    
+    if args.standalone:
+        # Run standalone data collection
+        exit_code = standalone_data_collection()
+        sys.exit(exit_code)
+    else:
+        # Run interactive driver
+        driver = TSIInteractiveDriver()
+        
+        # Check for command line arguments for auto-connection
+        if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
+            com_port = sys.argv[1].upper()
+            if not com_port.startswith("COM"):
+                com_port = f"COM{com_port}"
+            
+            if driver.connect_to_meter(com_port):
+                print("Auto-connected successfully!")
+            else:
+                print("Auto-connection failed. You can connect manually using 'connect' command.")
+        
+        # Show initial menu
+        driver.display_menu()
+        
+        # Start interactive loop
+        driver.run()
+
+
+if __name__ == "__main__":
+    main()
